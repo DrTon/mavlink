@@ -33,7 +33,8 @@ FORMAT_TO_STRUCT = {
     }
 
 class DFFormat(object):
-    def __init__(self, name, len, format, columns):
+    def __init__(self, type, name, len, format, columns):
+        self.type = type
         self.name = name
         self.len = len
         self.format = format
@@ -91,6 +92,20 @@ class DFMessage(object):
             ret += "%s : %s, " % (c, self._d[c])
         ret = ret[:-2] + "}"
         return ret
+
+    def get_msgbuf(self):
+        '''create a binary message buffer for a message'''
+        values = []
+        for i in range(len(self.fmt.columns)):
+            mul = self.fmt.msg_mults[i]
+            name = self.fmt.columns[i]
+            if name == 'Mode' and 'ModeNum' in self.fmt.columns:
+                name = 'ModeNum'
+            v = self._d[name]
+            if mul is not None:
+                v /= mul
+            values.append(v)
+        return struct.pack("BBB", 0xA3, 0x95, self.fmt.type) + struct.pack(self.fmt.msg_struct, *values)
                 
 
 class DFReader(object):
@@ -103,6 +118,8 @@ class DFReader(object):
         self.px4_timestamps = False
         self.px4_timebase = 0
         self.timestamp = 0
+        self.verbose = False
+        self.params = {}
         
     def _rewind(self):
         '''reset counters on rewind'''
@@ -125,8 +142,8 @@ class DFReader(object):
 
     def _find_time_base_px4(self, gps):
         '''work out time basis for the log - PX4 native'''
-        t = gps.GPSTime
-        self.timebase = (t - self.px4_timebase) * 1.0e-6
+        t = gps.GPSTime * 1.0e-6
+        self.timebase = t - self.px4_timebase
         self.px4_timestamps = True
 
     def _find_time_base(self):
@@ -141,11 +158,13 @@ class DFReader(object):
 
         if 'GPSTime' in gps1._fieldnames:
             self._find_time_base_px4(gps1)
+            self._rewind()
             return
             
         if 'T' in gps1._fieldnames:
             # it is a new style flash log with full timestamps
             self._find_time_base_new(gps1)
+            self._rewind()
             return
         
         counts1 = self.counts.copy()
@@ -238,6 +257,8 @@ class DFReader(object):
                 self.flightmode = mavutil.mode_string_apm(m.ModeNum)
             else:
                 self.flightmode = mavutil.mode_string_acm(m.Mode)
+        if type == 'PARM' and getattr(m, 'Name', None) is not None:
+            self.params[m.Name] = m.Value
         self._set_time(m)
 
     def recv_match(self, condition=None, type=None, blocking=False):
@@ -270,7 +291,7 @@ class DFReader_binary(DFReader):
         self.HEAD1 = 0xA3
         self.HEAD2 = 0x95
         self.formats = {
-            0x80 : DFFormat('FMT', 89, 'BBnNZ', "Type,Length,Name,Format,Columns")
+            0x80 : DFFormat(0x80, 'FMT', 89, 'BBnNZ', "Type,Length,Name,Format,Columns")
         }
         self._rewind()
         self._zero_time_base = zero_time_base
@@ -289,18 +310,33 @@ class DFReader_binary(DFReader):
             return None
             
         hdr = self.data[self.offset:self.offset+3]
-        if (ord(hdr[0]) != self.HEAD1 or ord(hdr[1]) != self.HEAD2):
-            return None
+        skip_bytes = 0
+        skip_type = None
+        # skip over bad messages
+        while (ord(hdr[0]) != self.HEAD1 or ord(hdr[1]) != self.HEAD2 or ord(hdr[2]) not in self.formats):
+            if skip_type is None:
+                skip_type = (ord(hdr[0]), ord(hdr[1]), ord(hdr[2]))
+            skip_bytes += 1
+            self.offset += 1
+            if len(self.data) - self.offset < 3:
+                return None
+            hdr = self.data[self.offset:self.offset+3]
         msg_type = ord(hdr[2])
+        if skip_bytes != 0:
+            print("Skipped %u bad bytes in log %s" % (skip_bytes, skip_type))
 
         self.offset += 3
         self.remaining -= 3
 
         if not msg_type in self.formats:
+            if self.verbose:
+                print("unknown message type %02x" % msg_type)
             raise Exception("Unknown message type %02x" % msg_type)
         fmt = self.formats[msg_type]
         if self.remaining < fmt.len-3:
             # out of data - can often happen half way through a message
+            if self.verbose:
+                print("out of data")
             return None
         body = self.data[self.offset:self.offset+(fmt.len-3)]
         try:
@@ -312,7 +348,8 @@ class DFReader_binary(DFReader):
         if name == 'FMT' and elements[0] not in self.formats:
             # add to formats
             # name, len, format, headings
-            self.formats[elements[0]] = DFFormat(null_term(elements[2]), elements[1],
+            self.formats[elements[0]] = DFFormat(elements[0],
+                                                 null_term(elements[2]), elements[1],
                                                  null_term(elements[3]), null_term(elements[4]))
 
         self.offset += fmt.len-3
@@ -340,7 +377,7 @@ class DFReader_text(DFReader):
         self.lines = f.readlines()
         f.close()
         self.formats = {
-            'FMT' : DFFormat('FMT', 89, 'BBnNZ', "Type,Length,Name,Format,Columns")
+            'FMT' : DFFormat(0x80, 'FMT', 89, 'BBnNZ', "Type,Length,Name,Format,Columns")
         }
         self._rewind()
         self._zero_time_base = zero_time_base
@@ -394,7 +431,7 @@ class DFReader_text(DFReader):
         if name == 'FMT':
             # add to formats
             # name, len, format, headings
-            self.formats[elements[2]] = DFFormat(elements[2], int(elements[1]), elements[3], elements[4])
+            self.formats[elements[2]] = DFFormat(int(elements[0]), elements[2], int(elements[1]), elements[3], elements[4])
 
         m = DFMessage(fmt, elements, False)
         self._add_msg(m)
